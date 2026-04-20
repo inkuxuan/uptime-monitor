@@ -3,6 +3,7 @@ method: "tcp"
 interval: 30
 retry_interval: 10
 max_retries: 2
+timeout: 5
 down_message: |
   down.
 up_message: |

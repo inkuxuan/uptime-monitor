@@ -222,58 +222,74 @@ class WebhookSender:
             thread.join(timeout=timeout)
 
 
+def step(
+    state: str, consecutive_failures: int, probe_ok: bool, max_retries: int
+) -> tuple[str, int, str | None]:
+    """Pure state-machine step. Returns (new_state, new_failures, transition).
+
+    transition is "up", "down", or None (no transition this step).
+    """
+    if probe_ok:
+        if state == "down":
+            return "up", 0, "up"
+        return "up", 0, None
+    if state == "down":
+        return "down", consecutive_failures, None
+    consecutive_failures += 1
+    if consecutive_failures > max_retries:
+        return "down", consecutive_failures, "down"
+    return "up", consecutive_failures, None
+
+
 def run(cfg: Config, stop_event: threading.Event) -> int:
     prober = PROBERS[cfg.method]
     sender = WebhookSender(cfg.webhook_url, stop_event)
 
     state = load_state()
     if state is None:
-        log.info(
-            "no prior state; performing silent initial probe of %s:%s", cfg.host, cfg.port
-        )
-        state = "up" if prober(cfg.host, cfg.port, cfg.timeout) else "down"
-        save_state(state)
-        log.info("initial state: %s", state)
+        log.info("no prior state; first probe will establish initial state")
     else:
         log.info("resumed prior state: %s", state)
 
     consecutive_failures = 0
 
     while not stop_event.is_set():
-        sleep_for = cfg.interval if (state == "up" and consecutive_failures == 0) else cfg.retry_interval
-        if stop_event.wait(timeout=sleep_for):
-            break
-
         ok = prober(cfg.host, cfg.port, cfg.timeout)
         log.debug("probe %s:%s -> %s", cfg.host, cfg.port, "ok" if ok else "fail")
 
-        if ok:
-            if state == "down":
-                log.info("target recovered; transitioning down -> up")
-                state = "up"
-                consecutive_failures = 0
-                save_state(state)
-                sender.send(build_embed(cfg, "up"))
-            else:
-                if consecutive_failures:
-                    log.info("probe recovered before threshold; resetting counter")
-                consecutive_failures = 0
+        if state is None:
+            state = "up" if ok else "down"
+            save_state(state)
+            log.info("initial state: %s", state)
         else:
-            if state == "down":
-                continue
-            consecutive_failures += 1
-            log.info(
-                "probe failed (%d/%d) for %s:%s",
-                consecutive_failures,
-                cfg.max_retries + 1,
-                cfg.host,
-                cfg.port,
+            prev_failures = consecutive_failures
+            state, consecutive_failures, transition = step(
+                state, consecutive_failures, ok, cfg.max_retries
             )
-            if consecutive_failures > cfg.max_retries:
+
+            if not ok and transition is None and state == "up":
+                log.info(
+                    "probe failed (%d/%d) for %s:%s",
+                    consecutive_failures,
+                    cfg.max_retries + 1,
+                    cfg.host,
+                    cfg.port,
+                )
+            elif ok and prev_failures and state == "up" and transition is None:
+                log.info("probe recovered before threshold; resetting counter")
+
+            if transition == "down":
                 log.info("threshold reached; transitioning up -> down")
-                state = "down"
                 save_state(state)
                 sender.send(build_embed(cfg, "down"))
+            elif transition == "up":
+                log.info("target recovered; transitioning down -> up")
+                save_state(state)
+                sender.send(build_embed(cfg, "up"))
+
+        sleep_for = cfg.interval if (state == "up" and consecutive_failures == 0) else cfg.retry_interval
+        if stop_event.wait(timeout=sleep_for):
+            break
 
     log.info("shutdown signal received; flushing in-flight webhook (<= %ds)", SHUTDOWN_GRACE_SECONDS)
     sender.wait_for_flush(SHUTDOWN_GRACE_SECONDS)

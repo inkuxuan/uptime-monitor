@@ -45,8 +45,8 @@ up_message: |
 ## Running
 
 ```sh
-uv run main.py              # normal
-uv run main.py --debug      # verbose per-probe logging
+uv run --frozen main.py              # normal
+uv run --frozen main.py --debug      # verbose per-probe logging
 ```
 
 Logs go to stdout. The process handles `SIGINT` / `SIGTERM` gracefully and exits within a few seconds.
